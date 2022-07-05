@@ -5,18 +5,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/Deichindianer/webhooks/v6/gitlab"
-	"github.com/honeycombio/libhoney-go"
-	"github.com/honeycombio/libhoney-go/transmission"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/honeycombio/libhoney-go"
+	"github.com/honeycombio/libhoney-go/transmission"
+	"github.com/zoidbergwill/gitlab-honeycomb-buildevents-webhooks-sink/internal/hook/types"
 )
 
 type Listener struct {
 	Config     Config
-	Hook       *gitlab.Webhook
 	HTTPServer *http.Server
 }
 
@@ -37,14 +37,8 @@ func New(cfg Config) (*Listener, error) {
 		return nil, fmt.Errorf("failed to initialise libhoney: %w", err)
 	}
 
-	hook, err := gitlab.New(gitlab.Options.Secret(cfg.HookSecret))
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup GitLab webhook: %w", err)
-	}
-
 	l := Listener{
 		Config: cfg,
-		Hook:   hook,
 	}
 
 	mux := http.NewServeMux()
@@ -59,11 +53,9 @@ func New(cfg Config) (*Listener, error) {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	return &Listener{
-		Config:     cfg,
-		Hook:       hook,
-		HTTPServer: srv,
-	}, nil
+	l.HTTPServer = srv
+
+	return &l, nil
 }
 
 func (l *Listener) Home(w http.ResponseWriter, r *http.Request) {
@@ -90,26 +82,35 @@ func (l *Listener) Healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (l *Listener) HandleRequest(w http.ResponseWriter, r *http.Request) {
-	event, err := l.Hook.Parse(r, gitlab.PipelineEvents, gitlab.JobEvents)
+	eventType := r.Header.Get("X-Gitlab-Event")
+
+	if len(eventType) == 0 {
+		log.Println("failed to find X-Gitlab-Event header")
+		w.WriteHeader(http.StatusBadRequest)
+	}
+
+	event, err := l.ParseHook(r, eventType)
 	if err != nil {
-		if errors.Is(err, gitlab.ErrParsingPayload) {
-			log.Printf("failed to parse payload, dumping received payload: %+v", event)
+		var parseErr ErrPayloadParse
+		if errors.As(err, &parseErr) {
+			log.Printf("failed to parse payload, dumping received payload: %+v", parseErr.Payload)
 			w.WriteHeader(http.StatusInternalServerError)
 		}
+
 		log.Printf("death: %s: %+v", err, event)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	switch e := event.(type) {
-	case gitlab.PipelineEventPayload:
+	case types.PipelineEventPayload:
 		err := l.handlePipeline(e)
 		if err != nil {
 			log.Printf("failed to handle pipeline event: %s", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-	case gitlab.JobEventPayload:
+	case types.JobEventPayload:
 		err := l.handleJob(e)
 		if err != nil {
 			log.Printf("failed to handle pipeline event: %s", err)
@@ -127,7 +128,7 @@ func (l *Listener) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (l *Listener) handlePipeline(p gitlab.PipelineEventPayload) error {
+func (l *Listener) handlePipeline(p types.PipelineEventPayload) error {
 	if p.ObjectAttributes.Duration == 0 || p.ObjectAttributes.Status == "running" {
 		return nil
 	}
@@ -170,12 +171,12 @@ func (l *Listener) handlePipeline(p gitlab.PipelineEventPayload) error {
 	if p.ObjectAttributes.CreatedAt.IsZero() {
 		return errors.New("Pipeline.ObjectAttributes.CreatedAt is zero")
 	}
-	ev.Timestamp = p.ObjectAttributes.CreatedAt.Time
+	ev.Timestamp = p.ObjectAttributes.CreatedAt
 	log.Printf("%+v\n", ev)
 	return nil
 }
 
-func (l *Listener) handleJob(j gitlab.JobEventPayload) error {
+func (l *Listener) handleJob(j types.JobEventPayload) error {
 	// if j.BuildStatus == "created" || j.BuildStatus == "running" || j.BuildStatus == "pending" {
 	// 	return nil
 	// }
@@ -224,7 +225,7 @@ func (l *Listener) handleJob(j gitlab.JobEventPayload) error {
 		return errors.New("BuildStartedAt time is not set")
 	}
 
-	ev.Timestamp = j.BuildStartedAt.Time
+	ev.Timestamp = j.BuildStartedAt
 	return nil
 }
 
